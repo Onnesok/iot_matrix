@@ -31,7 +31,7 @@
  *       Pahartoli plate -> GPIO9
  *       Noapara plate   -> GPIO10
  *       Raojan plate    -> GPIO11
- *
+ * 
  * Required libraries:
  *   Adafruit_SH110X, Adafruit_GFX, WiFi, HTTPClient, ArduinoJson
  */
@@ -39,8 +39,8 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
+ #include <Wire.h>
+ #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
 #include <math.h>
 
@@ -61,7 +61,6 @@ const char *PICKUP_LOCATION_ID   = "loc_1"; // CUET Campus (seeded as block_cuet
 #define ULTRASONIC_ECHO_PIN 3
 
 #define LDR_PIN              0   // ADC pin
-#define LASER_SAMPLE_INTERVAL_US 350
 
 #define CONFIRM_BUTTON_PIN   7   // Physical confirm/buzzer combo
 #define BUZZER_PIN           8
@@ -101,7 +100,6 @@ const float  OUT_OF_RANGE_CM                 = 15.0f * REAL_TO_DEMO_SCALE_CM_PER
 const unsigned long HOLD_TIME_FAR_MS         = 3500;    // 9 m case (~18 cm) requires 3.5 s
 const unsigned long HOLD_TIME_NEAR_MS        = 5000;    // 5 m case (~10 cm) requires 5 s
 const unsigned long BLOCK_SELECT_HOLD_MS     = 600;     // ms block plate must stay active
-const unsigned long LASER_TIMEOUT_MS         = 10000;   // user must verify within 10s
 const unsigned long BUTTON_LOCKOUT_MS        = 2000;    // ignore duplicate presses
 const unsigned long BUTTON_HOLD_TIMEOUT_MS   = 5000;    // >5s press cancels flow
 const uint8_t        PRESENCE_STABLE_SAMPLES = 4;       // require N consecutive readings in range
@@ -109,10 +107,15 @@ const float          DISTANCE_TOLERANCE_CM   = 3.0f;    // ±3 cm stability requ
 const uint8_t        ULTRASONIC_SAMPLE_COUNT = 5;       // samples per measurement
 
 int ambientLdrBaseline = 0;
-const int    LDR_INTENSITY_DELTA      = 220;     // intensity above baseline considered a laser hit
-const float  LASER_TARGET_FREQUENCY   = 1800.0f; // Hz (laser key fob is PWM'd)
-const float  LASER_FREQ_TOLERANCE     = 600.0f;  // ± tolerance
-const unsigned long LASER_SAMPLE_WINDOW_MS = 220;
+
+const int    LDR_REFERENCE_DELTA      = 1800;    // expected ADC delta when laser fully on
+const float  LDR_PERCENT_THRESHOLD_HIGH = 12.0f; // % above baseline required to start hold
+const float  LDR_PERCENT_THRESHOLD_LOW  = 8.0f;  // hysteresis release threshold
+const unsigned long LDR_HOLD_DURATION_MS = 4200; // hold time once threshold met
+const unsigned long LDR_TRIGGER_STABILITY_MS = 250; // time above threshold before countdown
+const int    LDR_MIN_ABS_DELTA        = 45;     // minimum raw ADC delta to consider valid
+const float  LDR_PERCENT_SMOOTH_ALPHA = 0.06f;   // smoothing factor for percent display
+const int    LDR_ADC_CONTINUE_DELTA   = 18;      // keep filling if raw delta above this
 
 const unsigned long BUTTON_DEBOUNCE_MS    = 45;
 const unsigned long STATUS_POLL_INTERVAL  = 2000;
@@ -160,6 +163,18 @@ String lastPickupName = "";
 String lastDestinationName = "";
 float lastStableDistanceCm = -1.0f;
 
+bool laserPercentInitialized = false;
+float currentLaserPercent = 0.0f;
+float smoothedLaserPercent = 0.0f;
+unsigned long currentLaserHoldMs = 0;
+unsigned long currentLaserTargetMs = LDR_HOLD_DURATION_MS;
+unsigned long laserHoldStartedAt = 0;
+bool laserHoldActive = false;
+int lastLdrReading = 0;
+bool laserAboveHysteresis = false;
+int lastLdrDelta = 0;
+unsigned long laserThresholdSatisfiedAt = 0;
+
 // ------------ Forward declarations ------------
 void connectWiFiBlocking();
 void ensureWiFi();
@@ -167,6 +182,7 @@ void scanI2CBus();
 void drawSplash();
 void drawInstruction(const char *title, const String &line2 = "", const String &line3 = "", const String &line4 = "");
 void showUltrasonicStatus(float distanceCm, unsigned long holdMs, bool stable, unsigned long targetHoldMs);
+void showLaserStatus(bool verified);
 unsigned long requiredHoldDurationMs(float distanceCm);
 void updateStateMachine(float distanceCm, bool distanceStable, int activeBlock, int ldrAdc);
 float readUltrasonicDistanceCm();
@@ -174,7 +190,10 @@ int detectActiveBlock();
 bool isWithinPresenceRange(float distanceCm);
 void resetPresenceTracking();
 bool updateDistanceStability(float distanceCm);
-bool detectLaserSignature();
+bool detectLaserSignature(int ldrAdc);
+float computeLaserPercent(int ldrAdc);
+void resetLaserTracking();
+void recalibrateLdrBaseline(uint8_t samples = 30, uint16_t delayMs = 5);
 bool confirmButtonPressed();
 void sendRideRequest();
 void pollRideStatus();
@@ -185,11 +204,11 @@ void setState(SystemState nextState);
 void setLEDs(bool yellow, bool red, bool green);
 
 // ===================================================================
-void setup() {
-  Serial.begin(115200);
+ void setup() {
+   Serial.begin(115200);
   delay(200);
   Serial.println("\n=== AERAS User-Side Block Boot ===");
-
+   
   pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
   pinMode(ULTRASONIC_ECHO_PIN, INPUT);
   pinMode(LDR_PIN, INPUT);
@@ -224,14 +243,7 @@ void setup() {
   connectWiFiBlocking();
 
   // Calibrate LDR baseline
-  long sum = 0;
-  const uint8_t samples = 50;
-  for (uint8_t i = 0; i < samples; i++) {
-    sum += analogRead(LDR_PIN);
-    delay(10);
-  }
-  ambientLdrBaseline = sum / samples;
-  Serial.printf("LDR baseline calibrated: %d\n", ambientLdrBaseline);
+  recalibrateLdrBaseline(50, 6);
 
   drawInstruction("Stand on a block", "Hold for 3 sec", "Laser after prompt", "Then press confirm");
   currentState = STATE_IDLE;
@@ -245,6 +257,8 @@ void loop() {
   float distanceCm = readUltrasonicDistanceCm();
   int activeBlock = detectActiveBlock();
   int ldrReading = analogRead(LDR_PIN);
+  lastLdrReading = ldrReading;
+  lastLdrDelta = max(0, ldrReading - ambientLdrBaseline);
   bool distanceStable = updateDistanceStability(distanceCm);
 
   updateStateMachine(distanceCm, distanceStable, activeBlock, ldrReading);
@@ -344,16 +358,12 @@ void updateStateMachine(float distanceCm, bool distanceStable, int activeBlock, 
     }
 
     case STATE_WAITING_LASER: {
-      if (!distanceStable || activeBlock != latchedBlockIndex) {
-        resetSystem("Presence lost");
-        break;
-      }
-      if (millis() - laserStateEnteredAt >= LASER_TIMEOUT_MS) {
-        resetSystem("Laser timeout");
+      if (activeBlock >= 0 && activeBlock != latchedBlockIndex) {
+        resetSystem("Block changed");
         break;
       }
 
-      bool verified = detectLaserSignature();
+      bool verified = detectLaserSignature(ldrAdc);
       showLaserStatus(verified);
       if (verified) {
         laserVerified = true;
@@ -439,10 +449,10 @@ void updateStateMachine(float distanceCm, bool distanceStable, int activeBlock, 
     case STATE_REJECTED_OR_ERROR: {
       if (millis() - stateStartedAt > 8000) {
         resetSystem("Cycle done");
-      }
+       }
       break;
-    }
-  }
+     }
+   }
 }
 
 // ===================================================================
@@ -466,8 +476,8 @@ float readUltrasonicDistanceCm() {
       }
     }
     delay(3);
-  }
-
+   }
+   
   if (validSamples == 0) {
     return -1.0f;
   }
@@ -509,44 +519,132 @@ bool updateDistanceStability(float distanceCm) {
       consecutiveInRangeSamples++;
     }
     lastStableDistanceCm = (lastStableDistanceCm < 0) ? distanceCm : ((lastStableDistanceCm * 0.7f) + (distanceCm * 0.3f));
-  } else {
+   } else {
     // distance jumped more than tolerance, restart stability counter
     consecutiveInRangeSamples = 1;
     lastStableDistanceCm = distanceCm;
   }
 
   return consecutiveInRangeSamples >= PRESENCE_STABLE_SAMPLES;
-}
-
+   }
+   
 // ===================================================================
-bool detectLaserSignature() {
-  unsigned long start = millis();
-  bool lastAbove = false;
-  int transitions = 0;
-  int maxReading = 0;
+float computeLaserPercent(int ldrAdc) {
+  int delta = max(0, ldrAdc - ambientLdrBaseline);
+  float instantPercent = (delta * 100.0f) / (float)LDR_REFERENCE_DELTA;
+  if (instantPercent < 0.0f) instantPercent = 0.0f;
+  if (instantPercent > 120.0f) instantPercent = 120.0f;
 
-  while (millis() - start < LASER_SAMPLE_WINDOW_MS) {
-    int reading = analogRead(LDR_PIN);
-    maxReading = max(maxReading, reading);
-    bool above = reading > (ambientLdrBaseline + LDR_INTENSITY_DELTA);
-    if (above != lastAbove) {
-      transitions++;
-      lastAbove = above;
-    }
-    delayMicroseconds(LASER_SAMPLE_INTERVAL_US);
+  if (!laserPercentInitialized) {
+    smoothedLaserPercent = instantPercent;
+    laserPercentInitialized = true;
+  } else {
+    smoothedLaserPercent =
+        (smoothedLaserPercent * (1.0f - LDR_PERCENT_SMOOTH_ALPHA)) +
+        (instantPercent * LDR_PERCENT_SMOOTH_ALPHA);
   }
 
-  float frequency = (transitions / 2.0f) * (1000.0f / LASER_SAMPLE_WINDOW_MS);
-  bool freqMatch = frequency >= (LASER_TARGET_FREQUENCY - LASER_FREQ_TOLERANCE) &&
-                   frequency <= (LASER_TARGET_FREQUENCY + LASER_FREQ_TOLERANCE);
-  bool intensityMatch = (maxReading - ambientLdrBaseline) > LDR_INTENSITY_DELTA;
+  currentLaserPercent = smoothedLaserPercent;
+  return currentLaserPercent;
+}
 
-  Serial.printf("Laser sample -> freq=%.1fHz  transition=%d  ΔADC=%d\n",
-                frequency,
-                transitions,
-                maxReading - ambientLdrBaseline);
+void resetLaserTracking() {
+  laserPercentInitialized = false;
+  currentLaserPercent = 0.0f;
+  smoothedLaserPercent = 0.0f;
+  currentLaserHoldMs = 0;
+  currentLaserTargetMs = LDR_HOLD_DURATION_MS;
+  laserHoldStartedAt = 0;
+  laserHoldActive = false;
+  laserAboveHysteresis = false;
+  laserThresholdSatisfiedAt = 0;
+}
 
-  return freqMatch && intensityMatch;
+void recalibrateLdrBaseline(uint8_t samples, uint16_t delayMs) {
+  if (samples == 0) return;
+  long sum = 0;
+  for (uint8_t i = 0; i < samples; i++) {
+    sum += analogRead(LDR_PIN);
+    delay(delayMs);
+  }
+  ambientLdrBaseline = sum / samples;
+  Serial.printf("LDR baseline recalibrated: %d\n", ambientLdrBaseline);
+}
+
+bool detectLaserSignature(int ldrAdc) {
+  unsigned long now = millis();
+  float percent = computeLaserPercent(ldrAdc);
+
+  if (!laserAboveHysteresis && percent >= LDR_PERCENT_THRESHOLD_HIGH) {
+    laserAboveHysteresis = true;
+  } else if (laserAboveHysteresis && percent <= LDR_PERCENT_THRESHOLD_LOW) {
+    laserAboveHysteresis = false;
+  }
+
+  bool aboveThreshold = (lastLdrDelta >= LDR_MIN_ABS_DELTA) ||
+                        (laserAboveHysteresis && lastLdrDelta >= LDR_ADC_CONTINUE_DELTA);
+
+  currentLaserTargetMs = LDR_HOLD_DURATION_MS;
+
+  if (aboveThreshold) {
+    if (laserThresholdSatisfiedAt == 0) {
+      laserThresholdSatisfiedAt = now;
+    }
+
+    if (!laserHoldActive) {
+    unsigned long stableDuration = now - laserThresholdSatisfiedAt;
+    if (stableDuration >= LDR_TRIGGER_STABILITY_MS) {
+      laserHoldActive = true;
+      laserHoldStartedAt = now;
+      currentLaserHoldMs = 0;
+    }
+    }
+
+    if (laserHoldActive) {
+      currentLaserHoldMs = now - laserHoldStartedAt;
+      if (currentLaserHoldMs > currentLaserTargetMs) {
+        currentLaserHoldMs = currentLaserTargetMs;
+      }
+      if (currentLaserHoldMs >= currentLaserTargetMs) {
+        return true;
+      }
+    }
+  } else {
+    bool keepFilling = laserHoldActive && lastLdrDelta >= LDR_ADC_CONTINUE_DELTA;
+    if (keepFilling) {
+      if (laserHoldStartedAt == 0) {
+        laserHoldStartedAt = now - currentLaserHoldMs;
+      }
+      currentLaserHoldMs = now - laserHoldStartedAt;
+      if (currentLaserHoldMs > currentLaserTargetMs) {
+        currentLaserHoldMs = currentLaserTargetMs;
+      }
+      if (currentLaserHoldMs >= currentLaserTargetMs) {
+        return true;
+      }
+    } else {
+      laserThresholdSatisfiedAt = 0;
+      laserHoldActive = false;
+      laserHoldStartedAt = 0;
+      currentLaserHoldMs = 0;
+    }
+  }
+
+  Serial.printf("LDR pct=%.1f d=%d hold=%lu/%lu stab=%lu/%lu ADC=%d base=%d thr=%.1f/%.1f hyst=%d keep=%s\n",
+                percent,
+                lastLdrDelta,
+                currentLaserHoldMs,
+                currentLaserTargetMs,
+                laserThresholdSatisfiedAt ? (now - laserThresholdSatisfiedAt) : 0,
+                LDR_TRIGGER_STABILITY_MS,
+                lastLdrReading,
+                ambientLdrBaseline,
+                LDR_PERCENT_THRESHOLD_HIGH,
+                LDR_PERCENT_THRESHOLD_LOW,
+                laserAboveHysteresis,
+                (laserHoldActive && lastLdrDelta > LDR_ADC_CONTINUE_DELTA) ? "yes" : "no");
+
+  return false;
 }
 
 // ===================================================================
@@ -573,7 +671,7 @@ bool confirmButtonPressed() {
       if (pressDuration >= BUTTON_HOLD_TIMEOUT_MS) {
         buttonHoldTimeoutTriggered = true;
         return false;
-      }
+     }
       playTonePattern(80, 1);
       return true;
     }
@@ -633,7 +731,7 @@ void sendRideRequest() {
                     "HTTP " + String(code),
                     http.errorToString(code),
                     "Red LED = error");
-  }
+ }
   http.end();
 }
 
@@ -713,6 +811,7 @@ void resetSystem(const char *reason) {
   buttonHoldTimeoutTriggered = false;
   buttonPressStartAt = 0;
   lastButtonAcceptedAt = 0;
+  resetLaserTracking();
   setLEDs(false, false, false);
   drawInstruction("AERAS Ready",
                   "Step on destination block",
@@ -726,8 +825,10 @@ void setState(SystemState nextState) {
   currentState = nextState;
   stateStartedAt = millis();
   if (nextState == STATE_WAITING_LASER) {
+    recalibrateLdrBaseline(24, 4);
     laserStateEnteredAt = stateStartedAt;
-  }
+    resetLaserTracking();
+   }
   if (nextState == STATE_WAITING_CONFIRM) {
     buttonHoldTimeoutTriggered = false;
     buttonPressStartAt = 0;
@@ -736,7 +837,7 @@ void setState(SystemState nextState) {
 
 // ===================================================================
 void updateIndicators() {
-  static unsigned long lastBlink = 0;
+   static unsigned long lastBlink = 0;
   static bool blinkState = false;
 
   unsigned long now = millis();
@@ -799,8 +900,8 @@ void drawInstruction(const char *title, const String &line2, const String &line3
   if (line3.length()) display.println(line3);
   if (line4.length()) display.println(line4);
   display.display();
-}
-
+ }
+ 
 // ===================================================================
 void drawSplash() {
   display.clearDisplay();
@@ -812,16 +913,13 @@ void drawSplash() {
   delay(1500);
 }
 
-void showUltrasonicStatus(float distanceCm, unsigned long holdMs, bool stable, unsigned long targetHoldMs);
-void showLaserStatus(bool verified);
-
 void showUltrasonicStatus(float distanceCm, unsigned long holdMs, bool stable, unsigned long targetHoldMs) {
-  display.clearDisplay();
-  display.setTextColor(SH110X_WHITE);
-
+   display.clearDisplay();
+   display.setTextColor(SH110X_WHITE);
+ 
   // Distance label
-  display.setTextSize(1);
-  display.setCursor(0, 0);
+   display.setTextSize(1);
+   display.setCursor(0, 0);
   display.print("DISTANCE  (<= ");
   display.print(MAX_DISTANCE_CM, 0);
   display.println("cm)");
@@ -831,12 +929,12 @@ void showUltrasonicStatus(float distanceCm, unsigned long holdMs, bool stable, u
   if (distanceCm > 0) {
     display.print(distanceCm, 0);
     display.println("cm");
-  } else {
+   } else {
     display.println("--cm");
-  }
-
+   }
+ 
   // Hold timer
-  display.setTextSize(1);
+   display.setTextSize(1);
   display.setCursor(0, 42);
   display.print("HOLD ");
   display.print(holdMs / 1000.0f, 1);
@@ -851,11 +949,11 @@ void showUltrasonicStatus(float distanceCm, unsigned long holdMs, bool stable, u
   if (stable && targetHoldMs > 0) {
     int width = (int)(min(1.0f, holdMs / (float)targetHoldMs) * 116);
     display.fillRect(1, 55, width, 6, SH110X_WHITE);
-  }
-
-  display.display();
-}
-
+   }
+ 
+   display.display();
+ }
+ 
 void showLaserStatus(bool verified) {
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
@@ -864,17 +962,51 @@ void showLaserStatus(bool verified) {
   display.setCursor(0, 0);
   display.println("LASER VERIFICATION");
 
+  display.setCursor(0, 14);
   display.setTextSize(2);
-  display.setCursor(0, 20);
-  if (verified) {
-    display.println("VERIFIED");
-  } else {
-    display.println("AIM LASER");
-  }
+  display.print((int)round(currentLaserPercent));
+  display.println("%");
 
   display.setTextSize(1);
-  display.setCursor(0, 50);
-  display.println(verified ? "Privilege confirmed" : "Point laser at sensor");
+  display.setCursor(0, 34);
+  if (verified) {
+    display.println("Privilege confirmed");
+  } else if (laserHoldActive) {
+    display.println("Hold steady...");
+  } else if (laserThresholdSatisfiedAt) {
+    display.println("Beam stabilizing...");
+  } else {
+    display.println("Aim light >8%");
+  }
+
+  display.setCursor(0, 44);
+  display.print("ADC ");
+  display.print(lastLdrReading);
+  display.print(" ∆");
+  display.print(lastLdrDelta);
+
+  display.setCursor(0, 54);
+  display.print("HOLD ");
+  if (currentLaserTargetMs > 0) {
+    display.print(currentLaserHoldMs / 1000.0f, 1);
+    display.print("/");
+    display.print(currentLaserTargetMs / 1000.0f, 1);
+    display.println("s");
+  } else {
+    display.println("--/-- s");
+  }
+
+  display.drawRect(0, 60, 118, 4, SH110X_WHITE);
+  if ((laserHoldActive || verified) && currentLaserTargetMs > 0) {
+    float progress = min(1.0f, currentLaserHoldMs / (float)currentLaserTargetMs);
+    int width = (int)(progress * 116);
+    display.fillRect(1, 61, width, 2, SH110X_WHITE);
+  } else if (laserThresholdSatisfiedAt && LDR_TRIGGER_STABILITY_MS > 0) {
+    unsigned long preHold = min((unsigned long)(millis() - laserThresholdSatisfiedAt), LDR_TRIGGER_STABILITY_MS);
+    float progress = min(1.0f, preHold / (float)LDR_TRIGGER_STABILITY_MS);
+    int width = (int)(progress * 116);
+    display.drawLine(1, 62, 1 + width, 62, SH110X_WHITE);
+  }
 
   display.display();
 }
@@ -921,4 +1053,5 @@ void scanI2CBus() {
       Serial.printf("I2C device found at 0x%02X\n", address);
     }
   }
-}
+ }
+ 
