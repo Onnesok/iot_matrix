@@ -25,7 +25,6 @@ interface Location {
 }
 
 export default function Home() {
-  const [email, setEmail] = useState('');
   const [stats, setStats] = useState<StatsPayload | null>(null);
   const [locations, setLocations] = useState<Location[]>([]);
   const [loadingStats, setLoadingStats] = useState(true);
@@ -60,13 +59,6 @@ export default function Home() {
     loadStats();
     loadLocations();
   }, []);
-
-  const handleJoin = (e: React.FormEvent) => {
-    e.preventDefault();
-    console.log('Email submitted:', email);
-    alert('Thank you for your interest! We will contact you soon.');
-    setEmail('');
-  };
 
   return (
     <div className="min-h-screen bg-black text-white relative overflow-hidden">
@@ -114,30 +106,6 @@ export default function Home() {
             >
               "Stand on a destination block, verify with light, press confirm, and the nearest registered puller is dispatched automatically."
             </motion.blockquote>
-
-            {/* Email Input Section */}
-            <motion.form
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.8, delay: 0.4 }}
-              onSubmit={handleJoin}
-              className="flex flex-col sm:flex-row gap-3 max-w-md"
-            >
-              <input
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="Enter your email"
-                className="flex-1 px-4 py-3 bg-black/50 border border-white/20 rounded-full focus:outline-none focus:border-green-400 focus:ring-2 focus:ring-green-400/20 transition-all text-white placeholder-gray-500 text-sm sm:text-base"
-                required
-              />
-              <button
-                type="submit"
-                className="px-6 py-3 bg-green-500/20 hover:bg-green-500/30 border border-green-400/50 rounded-full font-semibold text-green-400 transition-all text-sm sm:text-base whitespace-nowrap"
-              >
-                Interested
-              </button>
-            </motion.form>
 
             {/* Quick CTAs */}
             <motion.div

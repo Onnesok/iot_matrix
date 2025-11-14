@@ -16,6 +16,10 @@ interface Ride {
   pointsAwarded?: number;
   pickupLatitude?: number;
   pickupLongitude?: number;
+  pickupLocation?: Location;
+  destinationLocation?: Location;
+  acceptedAt?: string;
+  completedAt?: string;
 }
 
 interface Puller {
@@ -42,8 +46,9 @@ export default function RickshawPage() {
   const [notifications, setNotifications] = useState<Ride[]>([]);
   const [locations, setLocations] = useState<Location[]>([]);
   const [pointsHistory, setPointsHistory] = useState<any[]>([]);
+  const [recentRides, setRecentRides] = useState<Ride[]>([]);
   const [currentLocation, setCurrentLocation] = useState<{ lat: number; lng: number } | null>(null);
-  const [stats, setStats] = useState({ todayRides: 0, todayPoints: 0, avgRating: 0 });
+  const [stats, setStats] = useState({ todayRides: 0, todayPoints: 0, avgPointsPerRide: 0, lifetimeRides: 0 });
   const [showNotification, setShowNotification] = useState(false);
   const [newRideNotification, setNewRideNotification] = useState<Ride | null>(null);
   const notificationSoundRef = useRef<HTMLAudioElement | null>(null);
@@ -190,20 +195,33 @@ const fetchPullerStats = async (id?: string) => {
     if (data.puller) {
       setPuller(data.puller);
       setPointsHistory(data.pointsHistory || []);
+      setRecentRides(data.recentRides || []);
       
-      // Calculate today's stats
-      const today = new Date().toDateString();
-      const todayHistory = (data.pointsHistory || []).filter((entry: any) => 
-        new Date(entry.createdAt).toDateString() === today && entry.type === 'earned'
-      );
-      const todayPoints = todayHistory.reduce((sum: number, entry: any) => sum + entry.points, 0);
-      const todayRides = todayHistory.length;
-      
-      setStats({
-        todayRides,
-        todayPoints,
-        avgRating: data.puller.totalRides > 0 ? (data.puller.points / data.puller.totalRides) : 0
-      });
+      const fallbackAvg = data.puller.totalRides > 0 ? (data.puller.points / data.puller.totalRides) : 0;
+
+      if (data.stats) {
+        setStats({
+          todayRides: data.stats.todayRides ?? 0,
+          todayPoints: data.stats.todayPoints ?? 0,
+          avgPointsPerRide: data.stats.avgPointsPerRide ?? fallbackAvg,
+          lifetimeRides: data.stats.lifetimeRides ?? data.puller.totalRides ?? 0
+        });
+      } else {
+        // Fallback calculation using recent points history
+        const today = new Date().toDateString();
+        const todayHistory = (data.pointsHistory || []).filter((entry: any) => 
+          new Date(entry.createdAt).toDateString() === today && entry.type === 'earned'
+        );
+        const todayPoints = todayHistory.reduce((sum: number, entry: any) => sum + entry.points, 0);
+        const todayRides = todayHistory.length;
+        
+        setStats({
+          todayRides,
+          todayPoints,
+          avgPointsPerRide: fallbackAvg,
+          lifetimeRides: data.puller.totalRides ?? 0
+        });
+      }
 
       setActiveRide(data.activeRide || null);
       setNotifications(data.pendingRides || []);
@@ -417,6 +435,46 @@ const fetchPullerStats = async (id?: string) => {
     return `${(meters / 1000).toFixed(1)}km`;
   };
 
+const rideStatusStyles: Record<
+  string,
+  { label: string; className: string }
+> = {
+  completed: {
+    label: 'Completed',
+    className: 'bg-green-500/20 text-green-400 border-green-400/50'
+  },
+  accepted: {
+    label: 'Accepted',
+    className: 'bg-blue-500/20 text-blue-300 border-blue-400/50'
+  },
+  pickup_confirmed: {
+    label: 'Pickup Confirmed',
+    className: 'bg-amber-500/20 text-amber-300 border-amber-400/50'
+  },
+  pending: {
+    label: 'Pending',
+    className: 'bg-white/10 text-white border-white/20'
+  },
+  cancelled: {
+    label: 'Cancelled',
+    className: 'bg-red-500/20 text-red-300 border-red-400/50'
+  }
+};
+
+const getRideStatusMeta = (status: string) => {
+  return (
+    rideStatusStyles[status] || {
+      label: status.replace(/_/g, ' '),
+      className: 'bg-white/10 text-gray-300 border-white/20'
+    }
+  );
+};
+
+const formatRideTimestamp = (ride: Ride) => {
+  const time = ride.completedAt || ride.acceptedAt || ride.createdAt;
+  return new Date(time).toLocaleString();
+};
+
   if (!isLoggedIn) {
     return (
       <div className="min-h-screen bg-black text-white">
@@ -564,9 +622,9 @@ const fetchPullerStats = async (id?: string) => {
               
               <div className="flex items-center gap-4 sm:gap-5">
                 <div className="text-right bg-black/50 rounded-xl px-4 py-3 border border-white/10">
-                  <div className="text-3xl sm:text-4xl md:text-5xl font-bold text-green-400">
-                    {puller?.points || 0}
-                  </div>
+                <div className="text-3xl sm:text-4xl md:text-5xl font-bold text-green-400">
+                  {puller?.points || 0}
+                </div>
                   <div className="text-xs sm:text-sm text-gray-400 mt-1">Total Points</div>
                 </div>
                 <motion.button
@@ -600,7 +658,7 @@ const fetchPullerStats = async (id?: string) => {
                 whileHover={{ scale: 1.05 }}
                 className="text-center bg-black/50 rounded-xl p-3 sm:p-4 border border-white/10 hover:border-green-400/50 transition-all"
               >
-                <div className="text-2xl sm:text-3xl font-bold text-green-400 mb-1">{puller?.totalRides || 0}</div>
+                <div className="text-2xl sm:text-3xl font-bold text-green-400 mb-1">{stats.lifetimeRides || 0}</div>
                 <div className="text-xs sm:text-sm text-gray-400">Total Rides</div>
               </motion.div>
             </div>
@@ -777,6 +835,58 @@ const fetchPullerStats = async (id?: string) => {
                   </div>
                 )}
               </div>
+
+              {/* Recent Rides */}
+              <div className="bg-black/50 border border-white/10 rounded-xl p-6 sm:p-7 hover:border-green-400/50 transition-all">
+                <div className="flex items-center justify-between mb-5">
+                  <h2 className="text-2xl font-bold text-white">
+                    Recent Rides
+                  </h2>
+                  <span className="text-xs sm:text-sm text-gray-400">
+                    Last {Math.min(10, recentRides.length)} rides
+                  </span>
+                </div>
+                {recentRides.length === 0 ? (
+                  <div className="text-center py-10">
+                    <p className="text-gray-400 text-sm">No rides completed yet</p>
+                    <p className="text-gray-500 text-xs mt-2">Your completed rides will appear here</p>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {recentRides.map((ride, index) => {
+                      const statusMeta = getRideStatusMeta(ride.status);
+                      const pickupName = ride.pickupLocation?.name || getLocationName(ride.pickupLocationId);
+                      const destinationName = ride.destinationLocation?.name || getLocationName(ride.destinationLocationId);
+                      return (
+                        <motion.div
+                          key={ride.id}
+                          initial={{ opacity: 0, x: 20 }}
+                          animate={{ opacity: 1, x: 0 }}
+                          transition={{ delay: index * 0.05 }}
+                          className="bg-black/40 border border-white/10 rounded-xl p-4 sm:p-5 hover:border-green-400/50 transition-all"
+                        >
+                          <div className="flex flex-wrap items-center gap-3 justify-between">
+                            <div className="font-semibold text-base sm:text-lg text-white">
+                              {pickupName} → {destinationName}
+                            </div>
+                            <span className={`px-3 py-1 rounded-full text-xs font-semibold border ${statusMeta.className}`}>
+                              {statusMeta.label}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-4 mt-3 text-sm text-gray-400">
+                            <span>{formatRideTimestamp(ride)}</span>
+                            <span className="text-green-400 font-semibold">
+                              {ride.pointsAwarded !== undefined && ride.pointsAwarded !== null
+                                ? `+${ride.pointsAwarded} pts`
+                                : 'Points pending'}
+                            </span>
+                          </div>
+                        </motion.div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Sidebar */}
@@ -844,7 +954,7 @@ const fetchPullerStats = async (id?: string) => {
                     <span className="text-gray-400 text-sm">
                       Total Rides
                     </span>
-                    <span className="font-bold text-lg text-green-400">{puller?.totalRides || 0}</span>
+                    <span className="font-bold text-lg text-green-400">{stats.lifetimeRides || 0}</span>
                   </motion.div>
                   <motion.div
                     whileHover={{ scale: 1.02, x: 5 }}
@@ -854,7 +964,7 @@ const fetchPullerStats = async (id?: string) => {
                       Avg Points/Ride
                     </span>
                     <span className="font-bold text-lg text-green-400">
-                      {puller?.totalRides > 0 ? (puller.points / puller.totalRides).toFixed(1) : '0.0'}
+                      {Number(stats.avgPointsPerRide || 0).toFixed(1)}
                     </span>
                   </motion.div>
                 </div>

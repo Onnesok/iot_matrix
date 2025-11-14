@@ -34,7 +34,10 @@ export async function GET(
       );
     }
 
-      const [pointsHistory, rides, pendingRides] = await Promise.all([
+      const startOfToday = new Date();
+      startOfToday.setHours(0, 0, 0, 0);
+
+      const [pointsHistory, rides, pendingRides, todayRidesCount, todayPointsAggregate, lifetimeRidesCount] = await Promise.all([
         prisma.pointsHistory.findMany({
           where: { pullerId: puller.id },
           orderBy: { createdAt: 'desc' },
@@ -42,6 +45,10 @@ export async function GET(
         }),
         prisma.ride.findMany({
           where: { pullerId: puller.id },
+          include: {
+            pickupLocation: true,
+            destinationLocation: true
+          },
           orderBy: { createdAt: 'desc' },
           take: 10
         }),
@@ -52,6 +59,29 @@ export async function GET(
             destinationLocation: true
           },
           orderBy: { createdAt: 'desc' }
+        }),
+        prisma.ride.count({
+          where: {
+            pullerId: puller.id,
+            status: 'completed',
+            completedAt: { gte: startOfToday }
+          }
+        }),
+        prisma.ride.aggregate({
+          where: {
+            pullerId: puller.id,
+            status: 'completed',
+            completedAt: { gte: startOfToday }
+          },
+          _sum: {
+            pointsAwarded: true
+          }
+        }),
+        prisma.ride.count({
+          where: {
+            pullerId: puller.id,
+            status: 'completed'
+          }
         })
       ]);
 
@@ -67,12 +97,20 @@ export async function GET(
         orderBy: { createdAt: 'desc' }
       });
 
+      const stats = {
+        todayRides: todayRidesCount,
+        todayPoints: Number(todayPointsAggregate._sum.pointsAwarded ?? 0),
+        avgPointsPerRide: puller.totalRides > 0 ? Number(puller.points ?? 0) / puller.totalRides : 0,
+        lifetimeRides: lifetimeRidesCount
+      };
+
       return NextResponse.json({
         puller,
         pointsHistory,
         recentRides: rides,
         pendingRides,
-        activeRide
+        activeRide,
+        stats
       });
   } catch (error) {
     console.error('Error fetching puller:', error);
