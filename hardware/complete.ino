@@ -45,9 +45,9 @@
 #include <math.h>
 
 // ------------ Network + Backend configuration ------------
-const char *WIFI_SSID     = "One piece";
-const char *WIFI_PASSWORD = "anime@54321";
-const char *API_BASE_URL  = "http://192.168.0.102:3000/api"; // Update to your Next.js deployment
+const char *WIFI_SSID     = "Anime";
+const char *WIFI_PASSWORD = "12345678";
+const char *API_BASE_URL  = "https://iot-sage-x.vercel.app/api"; // Update to your Next.js deployment
 
 // Users and locations must exist in the seeded backend database
 const char *REGISTERED_USER_ID   = "user_block_cuet";
